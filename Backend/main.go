@@ -8,17 +8,18 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net"
 	"net/http"
-	"net/mail"
 	"os"
 	"strings"
 	"time"
 
+	"smtp-server-backend/imapserver"
+	"smtp-server-backend/smtplocalreceiver"
+	"smtp-server-backend/smtpserverreceiver"
+	"smtp-server-backend/storage"
+
 	"github.com/emersion/go-smtp"
 	"github.com/joho/godotenv"
-	"github.com/miekg/dns"
-	"github.com/toorop/go-dkim"
 	"golang.org/x/oauth2"
 )
 
@@ -31,6 +32,7 @@ var (
 	frontendURL  string
 	cookieSecure bool
 	tenantName   string
+	smtpDomain   string // Domain for SMTP server
 )
 
 // Create the OAuth2 config with Azure AD endpoints
@@ -53,6 +55,7 @@ func init() {
 	frontendURL = getEnvOrDefault("FRONTEND_URL", "")
 	cookieSecure = strings.ToLower(getEnvOrDefault("COOKIE_SECURE", "false")) == "true"
 	tenantName = getEnvOrDefault("TENANT_NAME", "")
+	smtpDomain = getEnvOrDefault("SMTP_DOMAIN", "")
 
 	log.Println("OAuth configuration loaded from environment")
 
@@ -400,178 +403,65 @@ func handleLogout(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// StoreMail stores received mail (implement as needed)
-func StoreMail(from, to, data string) {
-	log.Printf("Storing mail: From=%s To=%s Data=%s", from, to, data)
-	// TODO: Save to database, file, etc.
-}
-
-// SMTP Backend implements go-smtp Backend interface
-// Handles receiving emails
-
-type SMTPBackend struct{}
-
-func (bkd *SMTPBackend) Login(state *smtp.ConnectionState, username, password string) (smtp.Session, error) {
-	return &SMTPSession{}, nil
-}
-
-func (bkd *SMTPBackend) AnonymousLogin(state *smtp.ConnectionState) (smtp.Session, error) {
-	return &SMTPSession{}, nil
-}
-
-type SMTPSession struct {
-	from string
-	to   string
-	data string
-}
-
-func (s *SMTPSession) Mail(from string, opts smtp.MailOptions) error {
-	s.from = from
-	return nil
-}
-
-func (s *SMTPSession) Rcpt(to string) error {
-	s.to = to
-	return nil
-}
-
-func (s *SMTPSession) Data(r io.Reader) error {
-	msg, err := mail.ReadMessage(r)
-	if err != nil {
-		return err
-	}
-	s.data = ""
-	bodyBytes, err := io.ReadAll(msg.Body)
-	if err == nil {
-		s.data = string(bodyBytes)
-	}
-	StoreMail(s.from, s.to, s.data)
-	return nil
-}
-
-func (s *SMTPSession) Reset()        {}
-func (s *SMTPSession) Logout() error { return nil }
-
-// SendEmail sends an email using SMTP
-func SendEmail(smtpAddr, from, to, subject, body string) error {
-	msg := []byte("To: " + to + "\r\n" +
-		"Subject: " + subject + "\r\n" +
-		"\r\n" + body)
-	return smtp.SendMail(smtpAddr, nil, from, []string{to}, msg)
-}
-
-// SendEmailWithDNS sends an email by resolving recipient MX records and optionally signing with DKIM
-func SendEmailWithDNS(from, to, subject, body, dkimDomain, dkimSelector, dkimPrivateKey string) error {
-	// Resolve MX records for recipient domain
-	domainParts := strings.SplitN(to, "@", 2)
-	if len(domainParts) != 2 {
-		return fmt.Errorf("invalid recipient email: %s", to)
-	}
-	recipientDomain := domainParts[1]
-	c := dns.Client{}
-	m := dns.Msg{}
-	m.SetQuestion(dns.Fqdn(recipientDomain), dns.TypeMX)
-	resp, _, err := c.Exchange(&m, "8.8.8.8:53") // Use Google DNS
-	if err != nil {
-		return fmt.Errorf("DNS MX lookup failed: %v", err)
-	}
-	if len(resp.Answer) == 0 {
-		return fmt.Errorf("no MX records found for domain: %s", recipientDomain)
-	}
-	// Pick highest priority MX
-	mx := ""
-	priority := uint16(65535)
-	for _, ans := range resp.Answer {
-		if mxrec, ok := ans.(*dns.MX); ok {
-			if mxrec.Preference < priority {
-				priority = mxrec.Preference
-				mx = mxrec.Mx
-			}
-		}
-	}
-	if mx == "" {
-		return fmt.Errorf("no valid MX record found")
-	}
-	mx = strings.TrimSuffix(mx, ".")
-
-	// Build email message
-	msg := "From: " + from + "\r\n" +
-		"To: " + to + "\r\n" +
-		"Subject: " + subject + "\r\n" +
-		"MIME-Version: 1.0\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\n" + body
-
-	// DKIM signing (optional)
-	if dkimDomain != "" && dkimSelector != "" && dkimPrivateKey != "" {
-		options := dkim.NewSigOptions()
-		options.PrivateKey = []byte(dkimPrivateKey)
-		options.Domain = dkimDomain
-		options.Selector = dkimSelector
-		options.Headers = []string{"from", "to", "subject"}
-		options.AddSignatureTimestamp = true
-		options.BodyLength = 0
-		options.SignatureExpireIn = 3600
-		options.HeadersCanon = dkim.Relaxed
-		options.BodyCanon = dkim.Relaxed
-		options.Debug = false
-		dkimHeader, err := dkim.Sign(&options, []byte(msg))
-		if err != nil {
-			return fmt.Errorf("DKIM signing failed: %v", err)
-		}
-		msg = string(dkimHeader) + msg
-	}
-
-	// Connect to recipient MX server
-	addr := mx + ":25"
-	conn, err := net.Dial("tcp", addr)
-	if err != nil {
-		return fmt.Errorf("failed to connect to MX server: %v", err)
-	}
-	cSmtp, err := smtp.NewClient(conn, mx)
-	if err != nil {
-		return fmt.Errorf("failed to create SMTP client: %v", err)
-	}
-	defer cSmtp.Close()
-	if err := cSmtp.Mail(from); err != nil {
-		return fmt.Errorf("MAIL FROM failed: %v", err)
-	}
-	if err := cSmtp.Rcpt(to); err != nil {
-		return fmt.Errorf("RCPT TO failed: %v", err)
-	}
-	w, err := cSmtp.Data()
-	if err != nil {
-		return fmt.Errorf("DATA failed: %v", err)
-	}
-	_, err = w.Write([]byte(msg))
-	if err != nil {
-		return fmt.Errorf("write failed: %v", err)
-	}
-	w.Close()
-	cSmtp.Quit()
-	return nil
-}
-
 func main() {
-	// Register API routes
+	// Register API routes for OAuth
 	http.HandleFunc("/api/auth/login", enableCORS(handleLogin))
 	http.HandleFunc("/api/auth/callback", enableCORS(handleCallback))
 	http.HandleFunc("/api/auth/me", enableCORS(handleMe))
 	http.HandleFunc("/api/auth/logout", enableCORS(handleLogout))
 
-	// Start SMTP server on port 25 for receiving mail
+	storage, err := storage.NewSQLiteStorage("email.db")
+	if err != nil {
+		log.Fatalf("Failed to initialize storage: %v", err)
+		panic(err)
+	}
+	defer storage.Close()
+
+	for _, name := range []string{"INBOX", "Sent"} {
+		if err := storage.MailboxCreate(name); err != nil {
+			panic(err)
+		}
+	}
+
+	// Start SMTP server in a goroutine
 	go func() {
-		be := &SMTPBackend{}
+		be := smtpserverreceiver.NewSMTPBackend(storage)
 		s := smtp.NewServer(be)
 		s.Addr = ":25"
-		s.Domain = "mohitsamant.space"
-		s.AllowInsecureAuth = true // For demo only
-		log.Printf("SMTP server listening on port 25 for receiving mail...")
+		s.Domain = smtpDomain
+		s.ReadTimeout = 10 * time.Second
+		s.WriteTimeout = 10 * time.Second
+		s.MaxMessageBytes = 25 * 1024 * 1024 // 25MB
+		s.MaxRecipients = 50
+		s.AllowInsecureAuth = true // For testing only, remove in production
+
+		log.Printf("Starting SMTP server on port 25...")
 		if err := s.ListenAndServe(); err != nil {
 			log.Fatalf("SMTP server error: %v", err)
 		}
 	}()
 
-	// Start server
+	// sending mail server
+	go func() {
+		smtplocalreceiver.RunSMTPReceiver(storage, smtpDomain)
+	}()
+
+	// Imap server
+
+	go func() {
+		_, err := imapserver.NewIMAPServer(&imapserver.Backend{
+			Storage: storage,
+		}, ":143", true)
+		if err != nil {
+			log.Fatalf("Failed to start IMAP server: %v", err)
+		} else {
+			log.Printf("IMAP server starting on port %d...", 143)
+		}
+	}()
+
+	// Start HTTP server for OAuth
 	port := 8080
-	log.Printf("Backend server starting on port %d...", port)
+	log.Printf("Backend HTTP server starting on port %d...", port)
 	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", port), nil))
+	// select {}
 }
